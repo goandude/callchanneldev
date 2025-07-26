@@ -1,0 +1,24 @@
+.portalContainer {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background-color: #1a1a2e; /* Dark blue background */
+  z-index: 10;
+  gap: 20px;
+}
+
+.gif {
+  width: 300px;  /* Adjust size as needed */
+  height: 300px; /* Make height equal to width for a perfect circle */
+  object-fit: cover; /* Prevents the GIF from being stretched */
+  border-radius: 50%; /* This makes the image a circle */
+}
+
+.statusText {
+  color: #ffffff;
+  font-size: 1.2rem;
+  font-weight: 500;
+}
