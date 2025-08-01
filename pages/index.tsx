@@ -17,14 +17,15 @@ interface MatchingPreferences {
    interests: string[];
 }
 type AppState = 'IDLE' | 'AWAITING_MEDIA' | 'SEARCHING' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
-interface Profile { id: string; is_profile_complete: boolean; [key: string]: any; }
+interface Profile { id: string; is_profile_complete: boolean; nickname: string; [key: string]: any; }
 
 // --- Chat Controller Class ---
 class ChatController {
   private pc: RTCPeerConnection | null = null;
   private localStream: MediaStream | null = null;
-  private pollingInterval: NodeJS.Timeout | null = null;
-  private signalingPollingInterval: NodeJS.Timeout | null = null;
+  private matchChannel: any | null = null; // Using 'any' to avoid RealtimeChannel type issues
+  private signalingChannel: any | null = null;
+  private queuedCandidates: RTCIceCandidateInit[] = [];
   private userId: string;
   private partnerId: string | null = null;
   private roomId: string | null = null;
@@ -33,20 +34,23 @@ class ChatController {
   private onLocalStream: (stream: MediaStream | null) => void;
   private onRemoteStream: (stream: MediaStream | null) => void;
   private connectionTimeout: NodeJS.Timeout | null = null;
-  private onPartnerDisconnect: () => void; // ✅ NEW: Callback for disconnects
+  private onPartnerDisconnect: () => void;
+  private onPartnerProfile: (profile: Profile | null) => void;
 
   constructor(
   userId: string, 
   onStateChange: (state: AppState) => void, 
   onLocalStream: (stream: MediaStream | null) => void, 
   onRemoteStream: (stream: MediaStream | null) => void, 
-  onPartnerDisconnect: () => void // ✅ The missing parameter
+  onPartnerDisconnect: () => void,
+  onPartnerProfile: (profile: Profile | null) => void
 ) {
   this.userId = userId;
   this.onStateChange = onStateChange;
   this.onLocalStream = onLocalStream;
   this.onRemoteStream = onRemoteStream;
   this.onPartnerDisconnect = onPartnerDisconnect;
+  this.onPartnerProfile = onPartnerProfile;
 }
 
 
@@ -75,176 +79,234 @@ class ChatController {
   }
 }
 
- // In the ChatController class
-public startChat = async (preferences: MatchingPreferences): Promise<void> => {
-  this.setState('SEARCHING');
-  try {
-    // ✅ ADD THIS CHECK: Ensure we have a valid session before calling the function
-    const { data: { session }, error: sessionError } = await supabase.auth.getSession();
-    if (sessionError || !session) {
-      throw new Error("Authentication error: No active session found.");
-    }
+  public startChat = async (preferences: MatchingPreferences): Promise<void> => {
+    this.setState('SEARCHING');
+    this.listenForMatch(); // Start listening for a match immediately
 
-    const { data, error } = await supabase.functions.invoke('find-partner', { body: { preferences } });
-    if (error) throw error;
-
-    if (data.status === 'waiting') {
-      this.pollForMatch();
-    } else if (data.status === 'matched') {
-      this.stopPolling();
-      this.isOfferCreator = true;
-      await this.joinRoom(data.roomId, data.partnerId);
-    }
-  } catch (err) {
-    console.error("Error in startChat:", err);
-    this.setState('ERROR');
-  }
-} 
-
- // In the ChatController class in pages/index.tsx
-
-// pages/index.tsx (in the ChatController class)
-
-private pollForMatch = () => {
-  this.stopPolling();
-  this.pollingInterval = setInterval(async () => {
-    const { data: notifications, error: selectError } = await supabase
-      .from('notifications')
-      .select('payload')
-      .eq('user_id', this.userId);
-
-    if (selectError) {
-      console.error("Error polling for match:", selectError);
-      return;
-    }
-
-    if (notifications && notifications.length > 0) {
-      this.stopPolling();
-      const notification = notifications[0];
-      const { roomId, partnerId } = notification.payload;
-
-      // ADDED: Error handling for the delete operation
-      console.log("Match found. Attempting to delete notification...");
-      const { error: deleteError } = await supabase
-        .from('notifications')
-        .delete()
-        .eq('user_id', this.userId);
-
-      if (deleteError) {
-        console.error("❌ FAILED to delete notification after match:", deleteError);
-      } else {
-        console.log("✅ Successfully deleted notification after match.");
+    try {
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !session) {
+        throw new Error("Authentication error: No active session found.");
       }
-      
-      this.isOfferCreator = false;
-      await this.joinRoom(roomId, partnerId);
+
+      const { data, error } = await supabase.functions.invoke('find-partner', { body: { preferences } });
+      if (error) throw error;
+
+      if (data.status === 'matched') {
+        // This user initiated the match. They are the "offer creator".
+        this.isOfferCreator = true;
+        this.stopListeningForMatch(); // We found a match, no need to listen anymore.
+
+        const { roomId, partnerId } = data;
+
+        // Fetch profile in the background, don't block connection setup
+        supabase
+          .from('profiles')
+          .select('*')
+          .eq('id', partnerId)
+          .single()
+          .then(({ data: partnerProfile, error: profileError }) => {
+            if (profileError) console.error("Error fetching partner profile:", profileError);
+            this.onPartnerProfile(partnerProfile);
+          });
+
+        await this.joinRoom(roomId, partnerId);
+      }
+      // If status is 'waiting', we just keep listening. The realtime event will handle the rest.
+    } catch (err) {
+      console.error("Error in startChat:", err);
+      this.setState('ERROR');
+      this.stopListeningForMatch(); // Stop listening on error
     }
-  }, 1500);
-}
-  private stopPolling = () => { if (this.pollingInterval) clearInterval(this.pollingInterval); this.pollingInterval = null; }
+  }
+
+  private listenForMatch = () => {
+    this.stopListeningForMatch(); // Ensure no old listeners are running
+    const channel = supabase.channel(`match-for-${this.userId}`);
+
+    this.matchChannel = channel
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'notifications',
+          filter: `user_id=eq.${this.userId}`,
+        },
+        async (payload) => {
+          console.log('✅ Match found via Realtime!', payload.new);
+          this.stopListeningForMatch();
+
+          // Fetch partner's profile in the background, don't block connection setup
+          supabase
+            .from('profiles')
+            .select('*')
+            .eq('id', payload.new.payload.partnerId)
+            .single()
+            .then(({ data: partnerProfile, error: profileError }) => {
+              if (profileError) console.error("Error fetching partner profile:", profileError);
+              this.onPartnerProfile(partnerProfile);
+            });
+
+          const { roomId, partnerId } = payload.new.payload;
+
+          await supabase.from('notifications').delete().eq('id', payload.new.id);
+
+          await this.joinRoom(roomId, partnerId);
+        }
+      )
+      .subscribe((status, err) => {
+        if (status === 'SUBSCRIBED') {
+          console.log(`[Realtime] Subscribed to match notifications for user ${this.userId}`);
+        }
+        if (status === 'CHANNEL_ERROR') {
+          console.error(`[Realtime] Failed to subscribe to match notifications`, err);
+          this.setState('ERROR');
+        }
+      });
+  }
+
+  private stopListeningForMatch = () => {
+    if (this.matchChannel) {
+      supabase.removeChannel(this.matchChannel);
+      this.matchChannel = null;
+    }
+  }
 
   private joinRoom = async (roomId: string, partnerId: string): Promise<void> => {
     console.log("In Join Room");
     this.setState('CONNECTING');
     this.connectionTimeout = setTimeout(() => {
-    // Only fire if we are still stuck in a connecting state
       if (this.pc?.connectionState !== 'connected') {
         console.warn("Connection timed out. Resetting and finding a new partner.");
-        //this.hangUp(true); // `true` tells it to find a new partner
-          this.onPartnerDisconnect();
+        this.onPartnerDisconnect();
       }
-    }, 6000); // 6,000 milliseconds = 6 seconds
+    }, 6000);
 
-  
-    
     this.roomId = roomId;
     this.partnerId = partnerId;
     this.createPeerConnection();
-    this.pollForSignalingMessages();
-    if (this.isOfferCreator) {
-      await this.createOffer();
+    this.listenForSignalingMessages();
+    // The offer will now be created when the 'presence' event is received
+    // in listenForSignalingMessages, indicating the other user is ready.
+  }
+
+  private listenForSignalingMessages = () => {
+    this.stopListeningForSignaling();
+    if (!this.roomId) return;
+
+    const channel = supabase.channel(`signaling-for-${this.roomId}`);
+    this.signalingChannel = channel.on('presence', { event: 'join' }, ({ newPresences }) => {
+        // This event tells us another user has subscribed to this channel.
+        // If we are the offer creator, and the new user is our partner, we can now create the offer.
+        const partner = newPresences.find(p => p.user_id === this.partnerId);
+        if (partner && this.isOfferCreator) {
+            console.log('Partner has joined the signaling channel. Creating offer.');
+            this.createOffer();
+        }
+    })
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'signaling',
+          filter: `recipient_id=eq.${this.userId}`,
+        },
+        async (payload) => {
+          console.log('[Realtime] Received signaling message:', payload.new.payload.type);
+
+          const msg = payload.new;
+          await supabase.from('signaling').delete().eq('id', msg.id);
+
+          if (!this.pc) return;
+          const { type, sdp, candidate } = msg.payload;
+          try {
+            if (type === 'offer') {
+              await this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }));
+              await this.processIceCandidates();
+              const answer = await this.pc.createAnswer();
+              await this.pc.setLocalDescription(answer);
+              await this.sendSignalingMessage({ type: 'answer', sdp: this.pc.localDescription?.sdp });
+            } else if (type === 'answer') {
+              if (this.pc.signalingState !== 'stable') {
+                await this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }));
+                await this.processIceCandidates();
+              }
+            } else if (type === 'candidate') {
+              if (this.pc.remoteDescription) {
+                await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+              } else {
+                console.log('Queuing ICE candidate...');
+                this.queuedCandidates.push(candidate);
+              }
+            }
+          }
+          catch (e) { console.error("Signaling error:", e) }
+        }
+      )
+      
+      .subscribe(async (status, err) => {
+        if (status === 'SUBSCRIBED') {
+          console.log(`[Realtime] Subscribed to signaling for room ${this.roomId}`);
+         const trackStatus = await this.signalingChannel.track({ user_id: this.userId });
+         if (trackStatus !== 'ok') {
+            console.error('Failed to track presence on signaling channel');
+            this.setState('ERROR');
+         }
+        }
+        if (status === 'CHANNEL_ERROR') {
+          console.error(`[Realtime] Failed to subscribe to signaling`, err);
+          this.setState('ERROR');
+        }
+      });
+  }
+
+  
+  private async processIceCandidates(): Promise<void> {
+    try {
+      console.log(`Attempting to add  ${this.queuedCandidates.length} queued ICE candidates...`);
+      while (this.queuedCandidates.length > 0 && this.pc?.remoteDescription) {
+        const candidate = this.queuedCandidates.shift()!;
+        console.log('Trying to add a queued ICE candidate:', candidate);
+        await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+      }
+    } catch (e) {
+      console.error("Error processing ICE candidates:", e);
     }
   }
 
- // pages/index.tsx (in the ChatController class)
-
-private pollForSignalingMessages = () => {
-  this.stopSignalingPolling();
-  this.signalingPollingInterval = setInterval(async () => {
-          console.log("In pollforsingnallingmessages");
-
-    if (!this.roomId) return;
-    const { data: messages } = await supabase
-      .from('signaling')
-      .select('id, payload')
-      .eq('recipient_id', this.userId)
-      .eq('room_id', this.roomId);
-
-    if (messages && messages.length > 0) {
-      const messageIds = messages.map(m => m.id);
-
-      // ✅ ADDED: Error handling for the delete operation
-      const { error: deleteError } = await supabase
-        .from('signaling')
-        .delete()
-        .in('id', messageIds);
-
-      if (deleteError) {
-        console.error("❌ FAILED to delete signaling messages:", deleteError);
-      } else {
-        console.log(`✅ Successfully deleted ${messageIds.length} signaling messages.`);
-      }
-      
-      for (const msg of messages) {
-        if (!this.pc) continue;
-        const { type, sdp, candidate } = msg.payload;
-        try {
-          if (type === 'offer') {
-            await this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }));
-            const answer = await this.pc.createAnswer();
-            await this.pc.setLocalDescription(answer);
-            await this.sendSignalingMessage({ type: 'answer', sdp: this.pc.localDescription?.sdp });
-          } else if (type === 'answer') {
-            await this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }));
-          } else if (type === 'candidate' && this.pc.remoteDescription) {
-            await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
-          }
-        } catch (e) { console.error("Signaling error:", e) }
-      }
+  private stopListeningForSignaling = () => {
+    if (this.signalingChannel) {
+      supabase.removeChannel(this.signalingChannel);
+      this.signalingChannel = null;
     }
-  }, 1500);
-}
-  private stopSignalingPolling = () => { if (this.signalingPollingInterval) clearInterval(this.signalingPollingInterval); this.signalingPollingInterval = null; }
-  
+  }
+
   private sendSignalingMessage = async (payload: any) => {
-    console.log("In sendsignal message");
     if (this.partnerId && this.roomId) {
       await supabase.from('signaling').insert({ room_id: this.roomId, recipient_id: this.partnerId, payload });
     }
   }
-  
+
   private createPeerConnection = (): void => {
-  if (this.pc) return; 
-  this.pc = new RTCPeerConnection({ iceServers });
-  this.pc.onicecandidate = async (e) => { if (e.candidate) await this.sendSignalingMessage({ type: 'candidate', candidate: e.candidate }); };
-  
-  // ✅ UPDATED ONSCONNECTIONSTATECHANGE
-  this.pc.onconnectionstatechange = () => { 
-    const state = this.pc?.connectionState; 
-    if (state === 'connected') {
-      if (this.connectionTimeout) clearTimeout(this.connectionTimeout);
-      this.setState('CONNECTED'); 
-    } else if (state === 'disconnected' || state === 'failed') {
-      // Always call the simple hangup, never reconnect automatically
-     // this.hangUp(); 78
-      this.onPartnerDisconnect(); 
+    if (this.pc) return;
+    this.pc = new RTCPeerConnection({ iceServers });
+    this.pc.onicecandidate = async (e) => { if (e.candidate) await this.sendSignalingMessage({ type: 'candidate', candidate: e.candidate }); };
 
-    }
-  };
+    this.pc.onconnectionstatechange = () => {
+      const state = this.pc?.connectionState;
+      if (state === 'connected') {
+        if (this.connectionTimeout) clearTimeout(this.connectionTimeout);
+        this.setState('CONNECTED');
+      } else if (state === 'disconnected' || state === 'failed') {
+        this.onPartnerDisconnect();
+      }
+    };
 
-  this.localStream?.getTracks().forEach(track => this.pc!.addTrack(track, this.localStream!));
-  this.pc.ontrack = (e) => this.onRemoteStream(e.streams[0]);
-}
+    this.localStream?.getTracks().forEach(track => this.pc!.addTrack(track, this.localStream!));
+    this.pc.ontrack = (e) => this.onRemoteStream(e.streams[0]);
+  }
 
   private createOffer = async (): Promise<void> => {
     if (!this.pc) this.createPeerConnection();
@@ -253,54 +315,69 @@ private pollForSignalingMessages = () => {
     await this.sendSignalingMessage({ type: 'offer', sdp: this.pc!.localDescription?.sdp });
   }
 
-  // pages/index.tsx (in the ChatController class)
-
-private cleanup = async (): Promise<void> => {
-  if (this.connectionTimeout) {
+  private cleanup = async (): Promise<void> => {
+    if (this.connectionTimeout) {
       clearTimeout(this.connectionTimeout);
       this.connectionTimeout = null;
     }
 
-  this.stopPolling(); 
- 
-  this.stopSignalingPolling();
-  this.pc?.close();
-  this.pc = null;
-  this.isOfferCreator = false;
-  this.roomId = null;
-  this.partnerId = null;
+    this.stopListeningForMatch();
+    this.stopListeningForSignaling();
 
-  // ✅ ADD THIS: Clean up leftover signaling messages
-  await supabase.from('signaling').delete().eq('recipient_id', this.userId);
-}  
- // pages/index.tsx (in the ChatController class)
+    this.pc?.close();
+    this.pc = null;
+    this.isOfferCreator = false;
+    this.roomId = null;
+    this.partnerId = null;
 
-public hangUp = async (reconnect: boolean = false): Promise<void> => {
-  // 1. Clear the remote video stream from the UI
-  this.onRemoteStream(null);
+    this.queuedCandidates = [];
 
-  // 2. Clean up local state (polling intervals, peer connection)
-  await this.cleanup();
-
-  // 3. Call your Edge Function to clean the database
-  await supabase.functions.invoke('cleanup-notifications', {
-    body: { userId: this.userId }
-  });
-
-  // 4. Decide what to do next
-  if (reconnect) {
-    // For "Skip", immediately start the next search
-    this.startChat({ sex: 'any', city: '', country: '', interests: []  });
-  } else {
-    // For "End Call", return to the home screen
-    this.setState('IDLE');
+    await supabase.from('signaling').delete().eq('recipient_id', this.userId);
   }
-}
 
-  
+  public hangUp = async (reconnect: boolean = false): Promise<void> => {
+    this.onRemoteStream(null);
+    this.onPartnerProfile(null);
+    await this.cleanup();
+    await supabase.functions.invoke('cleanup-notifications', {
+      body: { userId: this.userId }
+    });
+
+    if (reconnect) {
+      this.startChat({ sex: 'any', city: '', country: '', interests: [] });
+    } else {
+      this.setState('IDLE');
+    }
+  }
+
   public toggleMute = (): void => { this.localStream?.getAudioTracks().forEach(t => t.enabled = !t.enabled); }
   public toggleVideo = (): void => { this.localStream?.getVideoTracks().forEach(t => t.enabled = !t.enabled); }
 }
+
+// --- Profile Overlay Component ---
+const ProfileOverlay: FC<{ profile: Profile | null }> = ({ profile }) => {
+  if (!profile) return null;
+
+  const { nickname, sex, city, country, interests } = profile;
+
+  return (
+    <div className="absolute bottom-20 left-4 bg-black/50 text-white p-3 rounded-lg text-sm z-20 max-w-xs pointer-events-none">
+      <p className="font-bold text-base">{nickname || 'Anonymous'}</p>
+      {sex && city && country && (
+        <p className="text-white/80">{`${sex}, from ${city}, ${country}`}</p>
+      )}
+      {interests && interests.length > 0 && (
+        <div className="flex flex-wrap gap-1 mt-2">
+          {interests.map((interest: string) => (
+            <span key={interest} className="bg-gray-700 px-2 py-1 rounded-full text-xs">
+              {interest}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
 
 // --- Main React Component ---
 const Home: FC = () => {
@@ -308,6 +385,7 @@ const Home: FC = () => {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [partnerProfile, setPartnerProfile] = useState<Profile | null>(null);
   const [appState, setAppState] = useState<AppState>('IDLE');
   const [matchingPrefs, setMatchingPrefs] = useState<MatchingPreferences>({ sex: 'any', city: '', country: '',  interests: [] });
   const [isMuted, setIsMuted] = useState(false);
@@ -316,7 +394,9 @@ const Home: FC = () => {
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const controllerRef = useRef<ChatController | null>(null);
   const [onlineCount, setOnlineCount] = useState(0); // ✅ NEW: State for online count
-  const [isAutoRequeuing, setIsAutoRequeuing] = useState(false); // ✅ NEW: State for auto-reconnect
+  const [isAutoRequeuing, setIsAutoRequeuing] = useState(false);
+  const isAutoRequeuingRef = useRef(isAutoRequeuing);
+  isAutoRequeuingRef.current = isAutoRequeuing;
   
   useEffect(() => {
     const handleAuthAndProfile = async () => {
@@ -341,13 +421,20 @@ const Home: FC = () => {
     if (session && !controllerRef.current) {
 
       const handlePartnerDisconnect = () => {
-        if (isAutoRequeuing) {
+        if (isAutoRequeuingRef.current) {
           controllerRef.current?.hangUp(true); // Automatically find new partner
         } else {
           controllerRef.current?.hangUp(false); // Go back to the home screen
         }
       };
-      const chatController = new ChatController(session.user.id, setAppState, setLocalStream, setRemoteStream, handlePartnerDisconnect);
+      const chatController = new ChatController(
+        session.user.id,
+        setAppState,
+        setLocalStream,
+        setRemoteStream,
+        handlePartnerDisconnect,
+        setPartnerProfile
+      );
       controllerRef.current = chatController;
       chatController.initialize();
     }
@@ -392,7 +479,7 @@ const Home: FC = () => {
   <>
     <Head><title>Video Chat</title></Head>
     {profile && !profile.is_profile_complete && (
-      <ProfileSetupModal user={session.user} onComplete={() => window.location.reload()} />
+      <ProfileSetupModal user={session.user} profile={profile} onComplete={() => window.location.reload()} />
     )}
     <main className="h-screen w-screen bg-black flex font-sans">
       <OnlineCounter onlineCount={onlineCount} />
@@ -403,6 +490,8 @@ const Home: FC = () => {
 
         <div className="absolute inset-0 z-0">
           <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-contain bg-black" />
+          {/* Display partner's profile info */}
+          {remoteStream && <ProfileOverlay profile={partnerProfile} />}
         </div>
 
         {/* --- MODIFICATION START --- */}
@@ -430,6 +519,10 @@ const Home: FC = () => {
 
         <div className="absolute top-4 right-4 w-60 rounded-lg overflow-hidden shadow-lg z-20 aspect-video">
           <video ref={localVideoRef} autoPlay playsInline muted className="w-full h-full object-cover bg-black/50" />
+          {/* Display local user's profile info */}
+          <div className="absolute bottom-0 left-0 right-0 p-2 bg-gradient-to-t from-black/60 to-transparent pointer-events-none">
+              <p className="text-white text-sm font-semibold truncate">{profile?.nickname || 'You'}</p>
+          </div>
           {isVideoOff && <div className="absolute inset-0 bg-black/70 flex items-center justify-center text-white/80">Video Off</div>}
         </div>
 

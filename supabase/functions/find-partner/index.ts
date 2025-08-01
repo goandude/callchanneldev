@@ -14,15 +14,14 @@ serve(async (req) => {
     if (!user) throw new Error('Authentication failed.');
 
     // ✅ FIX: Call the correct, simple RPC function
-    const { data: matchedUsers, error: rpcError } = await supabase
-      .rpc('match_partner', { requesting_user_id: user.id });
+    const { data: waitingPartner, error: rpcError } = await supabase
+      .rpc('match_partner', { requesting_user_id: user.id })
+      .single();
 
     if (rpcError) throw rpcError;
 
-    const waitingPartner = matchedUsers[0];
-
     if (waitingPartner) {
-      const partnerId = waitingPartner.matched_user_id;
+      const partnerId = waitingPartner.matched_user_id; // The column name from the DB function
       const roomId = `room_${crypto.randomUUID()}`;
       
       const supabaseAdmin = createClient(
